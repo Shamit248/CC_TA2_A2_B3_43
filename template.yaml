@@ -1,0 +1,300 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Event-driven serverless file processing architecture using AWS CloudFormation'
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: 'Email address to receive processing notifications via SNS'
+    Default: 'your-email@example.com' # Replace with your active email
+
+Resources:
+  # ==========================================
+  # 1. NETWORKING (VPC, Subnets, Gateways)
+  # ==========================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: TA2-VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: TA2-IGW
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: TA2-Public-Subnet
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: false
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: TA2-Private-Subnet
+
+  EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: TA2-NATGW
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: TA2-Public-RT
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: TA2-Private-RT
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for Processing Lambda'
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: TA2-Lambda-SG
+
+  # ==========================================
+  # 2. MESSAGING (SNS)
+  # ==========================================
+  ProcessingAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: FileProcessingAlerts
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+      TopicArn: !Ref ProcessingAlertsTopic
+
+  # ==========================================
+  # 3. IAM ROLE FOR LAMBDA
+  # ==========================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: S3AndSNSPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub 'arn:aws:s3:::ta2-processing-bucket-${AWS::AccountId}-${AWS::Region}/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref ProcessingAlertsTopic
+
+  # ==========================================
+  # 4. COMPUTE (Lambda Function)
+  # ==========================================
+  FileProcessingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: TA2-FileProcessingLambda
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref ProcessingAlertsTopic
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          import urllib.parse
+
+          s3_client = boto3.client('s3')
+          sns_client = boto3.client('sns')
+
+          def lambda_handler(event, context):
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+              
+              for record in event.get('Records', []):
+                  bucket = record['s3']['bucket']['name']
+                  key = urllib.parse.unquote_plus(record['s3']['object']['key'])
+                  size = record['s3']['object'].get('size', 0)
+                  
+                  # Avoid infinite recursive loop if writing to the same bucket
+                  if key.startswith('processed/'):
+                      continue
+                      
+                  # Write metadata log to S3
+                  log_key = f"processed/{key}.json"
+                  log_content = json.dumps({
+                      "original_file": key,
+                      "file_size": size,
+                      "status": "Processed",
+                      "timestamp": record['eventTime']
+                  })
+                  
+                  s3_client.put_object(
+                      Bucket=bucket,
+                      Key=log_key,
+                      Body=log_content,
+                      ContentType="application/json"
+                  )
+                  
+                  # Publish summary to SNS
+                  message = (
+                      f"File successfully processed!\n\n"
+                      f"Bucket: {bucket}\n"
+                      f"Key: {key}\n"
+                      f"Size: {size} bytes\n"
+                      f"Processed Log: s3://{bucket}/{log_key}"
+                  )
+                  
+                  sns_client.publish(
+                      TopicArn=sns_topic_arn,
+                      Subject="S3 File Processing Notification",
+                      Message=message
+                  )
+                  
+              return {"statusCode": 200, "body": json.dumps("Processing complete")}
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt FileProcessingFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::ta2-processing-bucket-${AWS::AccountId}-${AWS::Region}'
+
+  # ==========================================
+  # 5. STORAGE (S3 Bucket & Trigger)
+  # ==========================================
+  ProcessingBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: LambdaInvokePermission
+    Properties:
+      BucketName: !Sub 'ta2-processing-bucket-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt FileProcessingFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: uploads/
+
+Outputs:
+  BucketName:
+    Value: !Ref ProcessingBucket
+    Description: 'Upload your test files under the uploads/ prefix'
+  SNSTopicArn:
+    Value: !Ref ProcessingAlertsTopic
+  LambdaFunctionName:
+    Value: !Ref FileProcessingFunction
